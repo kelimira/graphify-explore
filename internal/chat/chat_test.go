@@ -89,3 +89,31 @@ func TestREPLWithContextOnlyAndCmdRunner(t *testing.T) {
 		t.Fatal(out.String())
 	}
 }
+
+func TestFollowUpWithKeywordsStaysInPreviousSlice(t *testing.T) {
+	s := &Session{G: load(t)}
+	s.Ask("what scans s3 buckets?")
+	c := s.Ask("Show me the error handling in that scanner")
+	if !strings.Contains(c.Text, "handle_error") || !strings.Contains(c.Text, "S3BucketScanner") {
+		t.Fatalf("follow-up ignored memory:\n%s", c.Text)
+	}
+}
+
+func TestVerifyRanges(t *testing.T) {
+	g := load(t)
+	ok, bad := Verify(g, "see src/jobs/worker.rs:L78-90 and src/jobs/worker.rs:L99")
+	if len(ok) != 1 || len(bad) != 1 || bad[0] != "src/jobs/worker.rs:L99" {
+		t.Fatalf("ok=%v bad=%v", ok, bad)
+	}
+}
+
+func TestMermaidInjection(t *testing.T) {
+	g := graph.New()
+	p := filepath.Join(t.TempDir(), "g.json")
+	os.WriteFile(p, []byte(`{"nodes":[{"id":"a","label":"x\"]-->evil[\"y","source_file":"a.go"},{"id":"b","label":"b"}],"links":[{"source":"a","target":"b","relation":"c]a\"lls"}]}`), 0o600)
+	g.LoadFile("r", p)
+	m := Mermaid(g, g.Expand([]int{0}, 5))
+	if strings.Contains(m, `\"`) || strings.Count(m, `"`) != 4 || strings.Contains(m, "c]a") {
+		t.Fatalf("unsafe mermaid:\n%s", m)
+	}
+}

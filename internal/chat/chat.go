@@ -15,16 +15,20 @@ import (
 )
 
 const (
-	MaxNodes     = 20
-	TokenBudget  = 1500
-	seedCount    = 6
-	followUpHits = 1 // below this many keyword hits a question is treated as a follow-up
+	MaxNodes    = 20
+	TokenBudget = 1500
+	seedCount   = 6
 )
+
+// anaphora marks a question that refers back to the previous answer.
+var anaphora = regexp.MustCompile(`(?i)\b(that|it|its|those|them|these|this one|same|previous|above)\b`)
 
 // Session keeps the last slice so follow-ups traverse adjacent nodes without re-indexing.
 type Session struct {
 	G    *graph.Graph
 	Last []int
+	Root string // local checkout root for editor links
+	GH   string // GitHub blob base (https://github.com/o/r/blob/main); wins over Root
 }
 
 type Context struct {
@@ -36,18 +40,30 @@ type Context struct {
 	Links       []string
 }
 
+// EstimateTokens is a len/4 heuristic, not a real tokenizer.
 func EstimateTokens(s string) int { return (len(s) + 3) / 4 }
 
 // Ask builds the context for a question and updates session memory.
 func (s *Session) Ask(q string) Context {
 	g := s.G
-	comms, hits := g.Route(q, seedCount)
+	var prefer map[int]bool
+	followUp := len(s.Last) > 0 && anaphora.MatchString(q)
+	if followUp {
+		// bias keyword hits toward the previous slice and its neighbours
+		prefer = map[int]bool{}
+		for _, n := range append(append([]int{}, s.Last...), g.Neighbors(s.Last)...) {
+			prefer[n] = true
+		}
+	}
+	comms, hits := g.RoutePrefer(q, seedCount, prefer)
 	var seeds []int
 	for _, h := range hits {
-		seeds = append(seeds, h.Node)
+		if !followUp || prefer[h.Node] {
+			seeds = append(seeds, h.Node)
+		}
 	}
-	if len(hits) < followUpHits && len(s.Last) > 0 {
-		// follow-up: pivot to neighbours of the previous slice, keep previous nodes first
+	if len(seeds) == 0 && len(s.Last) > 0 && (followUp || len(hits) == 0) {
+		// nothing matched in memory: pivot to the previous slice and its neighbours
 		seeds = append(append([]int{}, s.Last[:min(len(s.Last), seedCount)]...), g.Neighbors(s.Last)...)
 	}
 	sl := g.Expand(seeds, MaxNodes)
@@ -64,7 +80,7 @@ func (s *Session) Ask(q string) Context {
 	}
 	c.Mermaid = Mermaid(g, sl)
 	for _, n := range sl.Nodes {
-		if l := Link(&g.Nodes[n], "", ""); l != "" {
+		if l := Link(&g.Nodes[n], s.Root, s.GH); l != "" {
 			c.Links = append(c.Links, l)
 		}
 	}
@@ -82,7 +98,11 @@ func render(g *graph.Graph, q string, comms []string, sl graph.Slice) string {
 	b.WriteString("Edges:\n")
 	for _, e := range sl.Edges {
 		ed := g.Edges[e]
-		fmt.Fprintf(&b, "- %s -%s-> %s\n", g.Nodes[ed.From].Label, ed.Relation, g.Nodes[ed.To].Label)
+		rel := ed.Relation
+		if ed.Inferred {
+			rel += " (inferred cross-repo)"
+		}
+		fmt.Fprintf(&b, "- %s -%s-> %s\n", g.Nodes[ed.From].Label, rel, g.Nodes[ed.To].Label)
 	}
 	return b.String()
 }
@@ -111,7 +131,7 @@ func Mermaid(g *graph.Graph, sl graph.Slice) string {
 
 // Link gives an editor deep link (root = local checkout) or a GitHub blob URL (ghBase = https://github.com/o/r/blob/main).
 func Link(n *graph.Node, root, ghBase string) string {
-	if n.File == "" {
+	if n.File == "" || (ghBase == "" && root == "") {
 		return ""
 	}
 	if ghBase != "" {
@@ -120,7 +140,8 @@ func Link(n *graph.Node, root, ghBase string) string {
 	return fmt.Sprintf("vscode://file/%s/%s:%d", strings.TrimRight(root, "/"), n.File, n.Line())
 }
 
-var citeRe = regexp.MustCompile(`([\w./-]+\.\w+):L(\d+)`)
+// citeRe accepts file:L78 and file:L78-90; the range is checked by its start line.
+var citeRe = regexp.MustCompile(`([\w./-]+\.\w+):L(\d+)(?:-\d+)?`)
 
 // Verify marks each file:Lnn citation in an answer as real (in the graph) or not.
 func Verify(g *graph.Graph, answer string) (ok, bad []string) {
@@ -175,10 +196,17 @@ func REPL(ctx context.Context, s *Session, r Runner, in io.Reader, out io.Writer
 			fmt.Fprintf(out, "\nerror: %v\n", err)
 			continue
 		}
-		_, bad := Verify(s.G, buf.String())
-		if len(bad) > 0 {
-			fmt.Fprintf(out, "\n[unverified citations: %s]", strings.Join(bad, ", "))
-		}
-		fmt.Fprintf(out, "\n\n```mermaid\n%s```\n", c.Mermaid)
+		Finish(out, s.G, c, buf.String())
 	}
+}
+
+// Finish appends citation check, editor/GitHub links and the Mermaid diagram to an answer.
+func Finish(out io.Writer, g *graph.Graph, c Context, answer string) {
+	if _, bad := Verify(g, answer); len(bad) > 0 {
+		fmt.Fprintf(out, "\n[unverified citations: %s]", strings.Join(bad, ", "))
+	}
+	if len(c.Links) > 0 {
+		fmt.Fprintf(out, "\n\nLinks:\n- %s", strings.Join(c.Links, "\n- "))
+	}
+	fmt.Fprintf(out, "\n\n```mermaid\n%s```\n", c.Mermaid)
 }

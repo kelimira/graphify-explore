@@ -44,6 +44,7 @@ func (n *Node) Cite() string {
 type Edge struct {
 	From, To int // indexes into Graph.Nodes
 	Relation string
+	Inferred bool // cross-repo edge matched by bare id, not proven by the graph
 }
 
 type rawGraph struct {
@@ -62,7 +63,8 @@ type Graph struct {
 	Out, In  [][]int // edge indexes per node
 	Commits  map[string]string
 	byKey    map[string]int
-	byID     map[string]int // first node with that raw id, for cross-repo resolution
+	byID     map[string][]int // all nodes with that raw id, for cross-repo resolution
+	vocab    []string         // sorted posting tokens, for prefix lookup; nil = stale
 	postings map[string][]int
 	commPost map[string][]int // token -> community slot
 	comms    []commInfo
@@ -80,10 +82,11 @@ type commInfo struct {
 	Repo, Name string
 	ID         int
 	Members    []int
+	Terms      []string // routing vocabulary: explicit name tokens or the most distinctive member tokens
 }
 
 func New() *Graph {
-	return &Graph{Commits: map[string]string{}, byKey: map[string]int{}, byID: map[string]int{},
+	return &Graph{Commits: map[string]string{}, byKey: map[string]int{}, byID: map[string][]int{},
 		postings: map[string][]int{}, commPost: map[string][]int{}}
 }
 
@@ -111,9 +114,7 @@ func (g *Graph) add(repo string, r *rawGraph) {
 			n.Label = n.ID
 		}
 		g.byKey[n.Key] = len(g.Nodes)
-		if _, ok := g.byID[n.ID]; !ok {
-			g.byID[n.ID] = len(g.Nodes)
-		}
+		g.byID[n.ID] = append(g.byID[n.ID], len(g.Nodes))
 		g.Nodes = append(g.Nodes, n)
 	}
 	g.Out = append(g.Out, make([][]int, len(r.Nodes))...)
@@ -124,27 +125,35 @@ func (g *Graph) add(repo string, r *rawGraph) {
 			continue
 		}
 		if t, ok := g.byKey[repo+":"+l.Target]; ok {
-			g.link(f, t, l.Relation)
+			g.link(f, t, l.Relation, false)
 		} else {
 			g.pending = append(g.pending, pendingEdge{f, l.Target, l.Relation})
 		}
 	}
-	// resolve cross-repo edges, whichever repo was loaded first
+	// Resolve cross-repo edges, whichever repo was loaded first. Graphify ids are
+	// path-derived and can collide, so link only when exactly one node in another
+	// repo has the id, and flag the edge as inferred.
 	rest := g.pending[:0]
 	for _, p := range g.pending {
-		if t, ok := g.byID[p.target]; ok {
-			g.link(p.from, t, p.rel)
+		t, n := -1, 0
+		for _, c := range g.byID[p.target] {
+			if g.Nodes[c].Repo != g.Nodes[p.from].Repo {
+				t, n = c, n+1
+			}
+		}
+		if n == 1 {
+			g.link(p.from, t, p.rel, true)
 		} else {
 			rest = append(rest, p)
 		}
 	}
 	g.pending = rest
-	g.locs = nil
+	g.locs, g.vocab = nil, nil
 	g.index(base)
 }
 
-func (g *Graph) link(f, t int, rel string) {
-	g.Edges = append(g.Edges, Edge{f, t, rel})
+func (g *Graph) link(f, t int, rel string, inferred bool) {
+	g.Edges = append(g.Edges, Edge{f, t, rel, inferred})
 	e := len(g.Edges) - 1
 	g.Out[f] = append(g.Out[f], e)
 	g.In[t] = append(g.In[t], e)
@@ -155,6 +164,7 @@ func (g *Graph) index(base int) {
 	for i := range g.comms {
 		slot[fmt.Sprintf("%s/%d", g.comms[i].Repo, g.comms[i].ID)] = i
 	}
+	firstNew := len(g.comms)
 	g.commOf = append(g.commOf, make([]int, len(g.Nodes)-base)...)
 	for i := base; i < len(g.Nodes); i++ {
 		n := &g.Nodes[i]
@@ -163,11 +173,7 @@ func (g *Graph) index(base int) {
 		if !ok {
 			s = len(g.comms)
 			slot[k] = s
-			name := n.CommName
-			if name == "" {
-				name = fmt.Sprintf("community-%d", n.Community)
-			}
-			g.comms = append(g.comms, commInfo{Repo: n.Repo, Name: name, ID: n.Community})
+			g.comms = append(g.comms, commInfo{Repo: n.Repo, Name: n.CommName, ID: n.Community})
 		}
 		g.comms[s].Members = append(g.comms[s].Members, i)
 		g.commOf[i] = s
@@ -175,10 +181,47 @@ func (g *Graph) index(base int) {
 			g.postings[t] = append(g.postings[t], i)
 		}
 	}
+	for s := firstNew; s < len(g.comms); s++ {
+		g.nameCommunity(s)
+	}
+	g.commPost = map[string][]int{}
 	for s := range g.comms {
-		for _, t := range uniq(Tokens(g.comms[s].Name)) {
+		for _, t := range g.comms[s].Terms {
 			g.commPost[t] = append(g.commPost[t], s)
 		}
+	}
+}
+
+// nameCommunity covers real Graphify graphs, which carry only a numeric community id:
+// name it after its most distinctive member tokens (count x idf over labels and paths).
+func (g *Graph) nameCommunity(s int) {
+	c := &g.comms[s]
+	if c.Name != "" {
+		c.Terms = uniq(Tokens(c.Name))
+		return
+	}
+	cnt := map[string]float64{}
+	for _, m := range c.Members {
+		for _, t := range uniq(Tokens(g.Nodes[m].Label + " " + g.Nodes[m].File)) {
+			cnt[t]++
+		}
+	}
+	for t := range cnt {
+		cnt[t] *= math.Log(1 + float64(len(g.Nodes))/float64(len(g.postings[t])))
+	}
+	for t := range cnt {
+		c.Terms = append(c.Terms, t)
+	}
+	sort.Slice(c.Terms, func(i, j int) bool {
+		a, b := c.Terms[i], c.Terms[j]
+		return cnt[a] > cnt[b] || (cnt[a] == cnt[b] && a < b)
+	})
+	if len(c.Terms) > 8 {
+		c.Terms = c.Terms[:8]
+	}
+	c.Name = fmt.Sprintf("c%d", c.ID)
+	if len(c.Terms) > 0 {
+		c.Name = strings.Join(c.Terms[:min(3, len(c.Terms))], "-")
 	}
 }
 
@@ -241,13 +284,26 @@ func Keywords(q string) []string {
 	return out
 }
 
-// match returns posting list for a keyword, also matching longer tokens by prefix
-// ("scan" -> "scanner"). Prefix matching scans the vocabulary, which is small.
+// match returns posting lists for a keyword, also matching longer tokens by prefix
+// ("scan" -> "scanner") via binary search on the sorted vocabulary. Prefixes under
+// 4 chars match exactly only, so "get" cannot drag in thousands of tokens.
 func (g *Graph) match(kw string) [][]int {
 	var res [][]int
-	for t, p := range g.postings {
-		if t == kw || (len(kw) >= 3 && strings.HasPrefix(t, kw)) {
-			res = append(res, p)
+	if p, ok := g.postings[kw]; ok {
+		res = append(res, p)
+	}
+	if len(kw) < 4 {
+		return res
+	}
+	if g.vocab == nil {
+		for t := range g.postings {
+			g.vocab = append(g.vocab, t)
+		}
+		sort.Strings(g.vocab)
+	}
+	for i := sort.SearchStrings(g.vocab, kw); i < len(g.vocab) && strings.HasPrefix(g.vocab[i], kw); i++ {
+		if g.vocab[i] != kw {
+			res = append(res, g.postings[g.vocab[i]])
 		}
 	}
 	return res
@@ -261,11 +317,16 @@ type Hit struct {
 // Route is the two-tier lookup: score communities top-down, then rank symbols
 // bottom-up with a boost for membership in the best communities.
 func (g *Graph) Route(q string, k int) (comms []string, hits []Hit) {
+	return g.RoutePrefer(q, k, nil)
+}
+
+// RoutePrefer is Route with a 5x score boost for nodes in prefer (follow-up memory).
+func (g *Graph) RoutePrefer(q string, k int, prefer map[int]bool) (comms []string, hits []Hit) {
 	kws := Keywords(q)
 	cs := map[int]float64{}
 	for _, kw := range kws {
 		for t, ss := range g.commPost {
-			if t == kw || (len(kw) >= 3 && strings.HasPrefix(t, kw)) {
+			if t == kw || (len(kw) >= 4 && strings.HasPrefix(t, kw)) {
 				for _, s := range ss {
 					cs[s] += 1
 				}
@@ -283,6 +344,9 @@ func (g *Graph) Route(q string, k int) (comms []string, hits []Hit) {
 	}
 	for n := range scores {
 		scores[n] *= 1 + 0.5*cs[g.commOf[n]] // community boost
+		if prefer[n] {
+			scores[n] *= 5
+		}
 		if len(g.In[n])+len(g.Out[n]) > 0 {
 			scores[n] *= 1 + 0.1*math.Log1p(float64(len(g.In[n])+len(g.Out[n])))
 		}
