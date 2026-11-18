@@ -46,24 +46,33 @@ func EstimateTokens(s string) int { return (len(s) + 3) / 4 }
 // Ask builds the context for a question and updates session memory.
 func (s *Session) Ask(q string) Context {
 	g := s.G
-	var prefer map[int]bool
-	followUp := len(s.Last) > 0 && anaphora.MatchString(q)
+	comms, hits := g.RoutePrefer(q, seedCount, nil)
+	// a pronoun only marks a follow-up when the question is short or has no hits of its own
+	followUp := len(s.Last) > 0 && anaphora.MatchString(q) && (len(hits) == 0 || len(strings.Fields(q)) <= 6)
+	var seeds []int
 	if followUp {
 		// bias keyword hits toward the previous slice and its neighbours
-		prefer = map[int]bool{}
+		prefer := map[int]bool{}
 		for _, n := range append(append([]int{}, s.Last...), g.Neighbors(s.Last)...) {
 			prefer[n] = true
 		}
+		c2, h2 := g.RoutePrefer(q, seedCount, prefer)
+		for _, h := range h2 {
+			if prefer[h.Node] {
+				seeds = append(seeds, h.Node)
+			}
+		}
+		if len(seeds) > 0 {
+			comms = c2
+		}
 	}
-	comms, hits := g.RoutePrefer(q, seedCount, prefer)
-	var seeds []int
-	for _, h := range hits {
-		if !followUp || prefer[h.Node] {
+	if len(seeds) == 0 {
+		for _, h := range hits { // keep global hits; never drop them for the old slice
 			seeds = append(seeds, h.Node)
 		}
 	}
-	if len(seeds) == 0 && len(s.Last) > 0 && (followUp || len(hits) == 0) {
-		// nothing matched in memory: pivot to the previous slice and its neighbours
+	if len(seeds) == 0 && len(s.Last) > 0 {
+		// nothing matched anywhere: pivot to the previous slice and its neighbours
 		seeds = append(append([]int{}, s.Last[:min(len(s.Last), seedCount)]...), g.Neighbors(s.Last)...)
 	}
 	sl := g.Expand(seeds, MaxNodes)
@@ -88,12 +97,23 @@ func (s *Session) Ask(q string) Context {
 	return c
 }
 
+// clean flattens whitespace so a label cannot inject extra prompt lines.
+func clean(s string) string { return strings.Join(strings.Fields(s), " ") }
+
+// truncate caps the question so it cannot alone exceed the token budget.
+func truncate(s string, n int) string {
+	if len(s) > n {
+		return strings.ToValidUTF8(s[:n], "")
+	}
+	return s
+}
+
 func render(g *graph.Graph, q string, comms []string, sl graph.Slice) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "Question: %s\nCommunities: %s\nNodes:\n", q, strings.Join(comms, ", "))
+	fmt.Fprintf(&b, "Question: %s\nCommunities: %s\nNodes:\n", clean(truncate(q, 800)), strings.Join(comms, ", "))
 	for _, n := range sl.Nodes {
 		nd := &g.Nodes[n]
-		fmt.Fprintf(&b, "- %s [%s] %s\n", nd.Label, nd.Repo, nd.Cite())
+		fmt.Fprintf(&b, "- %s [%s] %s\n", clean(nd.Label), nd.Repo, nd.Cite())
 	}
 	b.WriteString("Edges:\n")
 	for _, e := range sl.Edges {
@@ -102,7 +122,7 @@ func render(g *graph.Graph, q string, comms []string, sl graph.Slice) string {
 		if ed.Inferred {
 			rel += " (inferred cross-repo)"
 		}
-		fmt.Fprintf(&b, "- %s -%s-> %s\n", g.Nodes[ed.From].Label, rel, g.Nodes[ed.To].Label)
+		fmt.Fprintf(&b, "- %s -%s-> %s\n", clean(g.Nodes[ed.From].Label), rel, clean(g.Nodes[ed.To].Label))
 	}
 	return b.String()
 }
@@ -162,13 +182,28 @@ type Runner interface {
 	Run(ctx context.Context, prompt string, out io.Writer) error
 }
 
+// limitBuf keeps at most 2 KiB of stderr.
+type limitBuf []byte
+
+func (b *limitBuf) Write(p []byte) (int, error) {
+	if room := 2048 - len(*b); room > 0 {
+		*b = append(*b, p[:min(len(p), room)]...)
+	}
+	return len(p), nil
+}
+
 type CmdRunner struct{ Argv []string }
 
 func (r CmdRunner) Run(ctx context.Context, prompt string, out io.Writer) error {
 	cmd := exec.CommandContext(ctx, r.Argv[0], r.Argv[1:]...)
 	cmd.Stdin = strings.NewReader(prompt)
 	cmd.Stdout = out
-	return cmd.Run()
+	var eb limitBuf
+	cmd.Stderr = &eb
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(eb)))
+	}
+	return nil
 }
 
 // ContextOnly is the offline fallback: it echoes the verified context instead of calling an LLM.

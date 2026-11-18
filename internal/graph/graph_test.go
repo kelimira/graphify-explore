@@ -136,3 +136,21 @@ func TestShortPrefixDoesNotExpand(t *testing.T) {
 		t.Fatalf("got %d posting lists", n)
 	}
 }
+
+func TestLoad100kNodesJSON(t *testing.T) {
+	var b strings.Builder
+	b.WriteString(`{"nodes":[`)
+	for i := 0; i < 100000; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, `{"id":"n%d","label":"Func%d","source_file":"pkg%d/f.go","source_location":"L1","community":%d}`, i, i, i%300, i%40)
+	}
+	b.WriteString(`],"links":[]}`)
+	p := write(t, t.TempDir(), b.String())
+	start := time.Now()
+	if err := New().LoadFile("big", p); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("JSON load of 100k nodes: %v", time.Since(start))
+}

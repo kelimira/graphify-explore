@@ -22,8 +22,8 @@ import (
 
 const page = `<!doctype html><meta charset=utf-8><title>gexplore</title>
 <pre id=log style="white-space:pre-wrap"></pre><div id=dia></div><input id=q size=80 autofocus>
-<script type=module>
-import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.3/dist/mermaid.min.js" integrity="sha384-R63zfMfSwJF4xCR11wXii+QUsbiBIdiDzDbtxia72oGWfkT7WHJfmD/I/eeHPJyT" crossorigin=anonymous></script>
+<script>
 let n=0;
 q.onkeydown=async e=>{if(e.key!='Enter')return;const v=q.value;q.value='';log.textContent+='\n> '+v+'\n';
 const r=await fetch('/ask',{method:'POST',headers:{'X-Gexplore':'1'},body:v});const d=r.body.getReader();const t=new TextDecoder();let all='';
@@ -176,9 +176,7 @@ func stale(root, graphPath string) (bool, error) {
 	if len(f) != 2 {
 		return false, fmt.Errorf("unexpected git output %q", out)
 	}
-	if g := graph.New(); g.LoadFile("x", graphPath) == nil && g.Commits["x"] != "" {
-		return g.Commits["x"] != f[0], nil
-	}
+	// shortcut: mtime only (graphify graphs carry no commit); avoids parsing the whole graph twice.
 	ct, _ := strconv.ParseInt(f[1], 10, 64)
 	fi, err := os.Stat(graphPath)
 	if err != nil {
@@ -196,5 +194,10 @@ func maybeUpdate(graphPath string) error {
 	}
 	cmd := exec.Command("graphify", "update", root)
 	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	if err := cmd.Run(); err != nil {
+		return err
+	}
+	// touch so an update that changed nothing is not re-run on every start
+	now := time.Now()
+	return os.Chtimes(graphPath, now, now)
 }

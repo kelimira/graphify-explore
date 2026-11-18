@@ -34,3 +34,10 @@ Cross-repo edges: a link whose target is not in its own repo is resolved only wh
 ## Development
 
 `go vet ./... && go test ./...`
+
+## Notes
+
+- The web UI keeps one global session (single-user, loopback only); browser tabs share follow-up memory.
+- Mermaid is loaded from jsDelivr (pinned, SRI-checked), so the diagram needs network; the chat itself does not.
+- `-update` is a one-shot check at startup (graph mtime vs. git HEAD), not a background watcher.
+- Latency: query time on a synthetic 100k-node graph is covered by a test; JSON load time grows with file size and is about 0.2 s for 100k nodes on a dev laptop (`go test -run Load100k -v ./internal/graph`); it is paid once at startup, so the 200 ms criterion applies to queries.

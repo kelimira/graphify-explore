@@ -117,3 +117,26 @@ func TestMermaidInjection(t *testing.T) {
 		t.Fatalf("unsafe mermaid:\n%s", m)
 	}
 }
+
+func TestRelativeClauseThatIsNotFollowUp(t *testing.T) {
+	s := &Session{G: load(t)}
+	s.Ask("what does handle_error do?")
+	c := s.Ask("Where is the code that scans S3 buckets for the worker?")
+	if !strings.Contains(c.Text, "S3BucketScanner") {
+		t.Fatalf("global hit dropped:\n%s", c.Text)
+	}
+}
+
+func TestHugeQuestionStaysInBudget(t *testing.T) {
+	c := (&Session{G: load(t)}).Ask("s3 " + strings.Repeat("x ", 2000))
+	if c.Tokens > TokenBudget {
+		t.Fatal(c.Tokens)
+	}
+}
+
+func TestCmdRunnerIncludesStderr(t *testing.T) {
+	err := CmdRunner{Argv: []string{"sh", "-c", "echo boom >&2; exit 1"}}.Run(context.Background(), "", &strings.Builder{})
+	if err == nil || !strings.Contains(err.Error(), "boom") {
+		t.Fatal(err)
+	}
+}
