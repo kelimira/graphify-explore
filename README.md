@@ -66,3 +66,15 @@ feat: Create conversational codebase Q&A application powered by Graphify AST gra
   • AST Indexer: Graphify CLI (graphify explain, graphify path, graphify-out/graph.json).
   • LLM Interface: Zero-API / local CLI runner (Claude Code, Gemini CLI, or OpenAI SDK).
   • Interface: Lightweight Web UI (Vite / React or Go HTML template) and CLI interactive terminal mode.
+
+---
+
+## Usage
+
+```
+go build -o gexplore ./cmd/gexplore
+./gexplore -graph api=api/graphify-out/graph.json -graph ui=ui/graphify-out/graph.json -llm "claude -p"
+./gexplore -graph api=graphify-out/graph.json -web :8080
+```
+
+Repeat `-graph` for a cross-repo mesh. Without `-llm`, the grounded context is printed. `-update` runs `graphify update` at startup if HEAD moved past the graph's commit.
